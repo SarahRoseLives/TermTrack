@@ -4,6 +4,7 @@ import (
     "log"
 
     "termtrack/ui/footer"
+    "termtrack/ui/header" // <-- 1. Import the new header package
     mapview "termtrack/ui/map"
 
     tea "github.com/charmbracelet/bubbletea"
@@ -18,6 +19,7 @@ type model struct {
     width  int // Terminal width
     height int // Terminal height
 
+    headerModel header.Model // <-- 2. Add header to the main model
     mapModel    mapview.Model // The map component
     footerModel footer.Model  // The footer component
 
@@ -35,10 +37,14 @@ func initialModel() model {
     // Create the footer model
     footerMod := footer.New(mapShapePath)
 
+    // Create the header model
+    headerMod := header.New() // <-- 3. Initialize the header
+
     // Set the initial zoom on the footer
     footerMod.SetZoom(mapMod.GetZoomLevel())
 
     return model{
+        headerModel: headerMod, // <-- 4. Add header to the returned model
         mapModel:    mapMod,
         footerModel: footerMod,
     }
@@ -58,6 +64,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     }
 
     var (
+        headerCmd tea.Cmd // <-- 5. Add a command for the header
         mapCmd    tea.Cmd
         footerCmd tea.Cmd
         cmds      []tea.Cmd
@@ -69,18 +76,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         m.height = msg.Height
 
         // --- Layout ---
-        // Give the footer 1 line, and the map gets the rest
+        // 6. Adjust layout for all three components
+        headerHeight := 1
         footerHeight := 1
-        mapHeight := m.height - footerHeight
+        mapHeight := m.height - headerHeight - footerHeight
 
         // Send resized messages to children
+        headerMsg := tea.WindowSizeMsg{Width: m.width, Height: headerHeight}
+        m.headerModel, headerCmd = m.headerModel.Update(headerMsg)
+
         mapMsg := tea.WindowSizeMsg{Width: m.width, Height: mapHeight}
         m.mapModel, mapCmd = m.mapModel.Update(mapMsg)
 
         footerMsg := tea.WindowSizeMsg{Width: m.width, Height: footerHeight}
         m.footerModel, footerCmd = m.footerModel.Update(footerMsg)
 
-        cmds = append(cmds, mapCmd, footerCmd)
+        cmds = append(cmds, headerCmd, mapCmd, footerCmd)
 
     case tea.KeyMsg:
         switch msg.String() {
@@ -96,10 +107,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         }
 
     default:
-        // Pass any other messages to children (e.g., mouse)
+        // Pass any other messages to all children
+        m.headerModel, headerCmd = m.headerModel.Update(msg) // <-- 7. Pass messages to header
         m.mapModel, mapCmd = m.mapModel.Update(msg)
         m.footerModel, footerCmd = m.footerModel.Update(msg)
-        cmds = append(cmds, mapCmd, footerCmd)
+        cmds = append(cmds, headerCmd, mapCmd, footerCmd)
     }
 
     return m, tea.Batch(cmds...)
@@ -107,10 +119,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
     // --- Error View ---
-
-    // ---
-    // THIS IS THE FIX: Changed 'm.err !=.' to 'm.err != nil'
-    // ---
     if m.err != nil {
         errorStyle := lipgloss.NewStyle().
             Width(m.width).
@@ -126,11 +134,17 @@ func (m model) View() string {
     }
 
     // --- Normal View ---
+    headerView := m.headerModel.View() // <-- 8. Get the header's view
     mapView := m.mapModel.View()
     footerView := m.footerModel.View()
 
     // Stack them vertically
-    return lipgloss.JoinVertical(lipgloss.Left, mapView, footerView)
+    // 9. Add the header to the vertical join
+    return lipgloss.JoinVertical(lipgloss.Left,
+        headerView,
+        mapView,
+        footerView,
+    )
 }
 
 func main() {
