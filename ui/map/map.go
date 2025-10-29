@@ -7,28 +7,28 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/jonas-p/go-shp"
+
+	"termtrack/sbs" // <-- 1. Import sbs package for the Aircraft struct
 )
 
 // Constants for Panning and Zooming
 const (
-	panFactor  = 0.1 // Pan 10% of the current view width/height
-	zoomFactor = 1.2 // Zoom in/out by 20%
+	panFactor  = 0.1
+	zoomFactor = 1.2
 )
 
-// ---
-// NEW: Path for the airport data
 const airportShapePath = "airportdata/ne_10m_airports.shp"
-// ---
 
 // Model holds the map's state
 type Model struct {
-	width  int // Viewport width
-	height int // Viewport height
+	width  int
+	height int
 
-	mapPolygons   []*shp.Polygon // Polygons from shapefile
-	airportPoints []*shp.Point   // <-- NEW: Store airport points
-	originalBounds shp.Box        // The bounds of the entire map, never changes
-	viewBounds     shp.Box        // The bounds of the current viewport (pans and zooms)
+	mapPolygons   []*shp.Polygon
+	airportPoints []*shp.Point
+	aircraft      map[string]*sbs.Aircraft // <-- 2. Add aircraft map
+	originalBounds shp.Box
+	viewBounds     shp.Box
 }
 
 // loadMapData reads the shapefile and computes bounding box manually
@@ -88,21 +88,19 @@ func New(mapShapePath string) (Model, error) {
 	}
 
 	// 2. Load points (airport data)
-	// We call the function from airports.go
 	points, err := loadAirportData(airportShapePath)
 	if err != nil {
-		// For now, we'll fail if airports don't load.
-		// You could also just log this error and continue without airports.
 		return Model{}, fmt.Errorf("failed to load airport data: %w", err)
 	}
 
 	return Model{
 		mapPolygons:    polygons,
-		airportPoints:  points, // <-- NEW: Assign loaded points
-		originalBounds: bounds, // Store the original bounds
-		viewBounds:     bounds, // The view starts fully zoomed out
-		width:          80,     // Default width
-		height:         23,     // Default height (24 - 1 for footer)
+		airportPoints:  points,
+		aircraft:       make(map[string]*sbs.Aircraft), // <-- 3. Initialize map
+		originalBounds: bounds,
+		viewBounds:     bounds,
+		width:          80,
+		height:         23,
 	}, nil
 }
 
@@ -110,25 +108,42 @@ func (m Model) Init() tea.Cmd {
 	return nil
 }
 
+// --- 4. New methods for aircraft and auto-zoom ---
+
+// UpdateAircraft receives the master list from main.go
+func (m *Model) UpdateAircraft(allAircraft map[string]*sbs.Aircraft) {
+	m.aircraft = allAircraft
+}
+
+// SetViewToLocation centers and zooms the map on a specific lat/lon
+func (m *Model) SetViewToLocation(lat, lon float64) {
+	// Set a small (zoomed-in) bounding box
+	// 0.5 degrees is an arbitrary "zoom" level
+	const zoomSize = 0.5
+	m.viewBounds.MinX = lon - zoomSize
+	m.viewBounds.MaxX = lon + zoomSize
+	m.viewBounds.MinY = lat - zoomSize
+	m.viewBounds.MaxY = lat + zoomSize
+}
+
+// --- End of new methods ---
+
+
 // zoom zooms the viewBounds in or out, centered on the current view
 func (m *Model) zoom(factor float64) {
-	// Get current center and dimensions
 	centerX := (m.viewBounds.MinX + m.viewBounds.MaxX) / 2
 	centerY := (m.viewBounds.MinY + m.viewBounds.MaxY) / 2
 	width := m.viewBounds.MaxX - m.viewBounds.MinX
 	height := m.viewBounds.MaxY - m.viewBounds.MinY
 
-	// Calculate new dimensions
 	newWidth := width * factor
 	newHeight := height * factor
 
-	// Don't zoom out further than the original map
 	if newWidth > (m.originalBounds.MaxX-m.originalBounds.MinX) || newHeight > (m.originalBounds.MaxY-m.originalBounds.MinY) {
 		m.viewBounds = m.originalBounds
 		return
 	}
 
-	// Set new bounds centered on the same point
 	m.viewBounds.MinX = centerX - (newWidth / 2)
 	m.viewBounds.MaxX = centerX + (newWidth / 2)
 	m.viewBounds.MinY = centerY - (newHeight / 2)
@@ -140,11 +155,9 @@ func (m *Model) pan(dx, dy float64) {
 	width := m.viewBounds.MaxX - m.viewBounds.MinX
 	height := m.viewBounds.MaxY - m.viewBounds.MinY
 
-	// Calculate pan delta
 	panX := width * dx
 	panY := height * dy
 
-	// Apply pan
 	m.viewBounds.MinX += panX
 	m.viewBounds.MaxX += panX
 	m.viewBounds.MinY += panY
@@ -153,7 +166,6 @@ func (m *Model) pan(dx, dy float64) {
 
 // GetZoomLevel returns the current zoom factor
 func (m Model) GetZoomLevel() float64 {
-	// Avoid divide by zero
 	if m.viewBounds.MaxX == m.viewBounds.MinX {
 		return 1.0
 	}
@@ -164,27 +176,22 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
-		m.height = msg.Height // This is the height *given* by the parent
+		m.height = msg.Height
 
 	case tea.KeyMsg:
 		switch msg.String() {
-		// --- Panning ---
 		case "k", "up":
-			m.pan(0, panFactor) // Pan Up (move map down, so increase Y)
+			m.pan(0, panFactor)
 		case "l", "down":
-			m.pan(0, -panFactor) // Pan Down (move map up, so decrease Y)
+			m.pan(0, -panFactor)
 		case "j", "left":
-			m.pan(-panFactor, 0) // Pan Left (move map right, so decrease X)
+			m.pan(-panFactor, 0)
 		case ";", "right":
-			m.pan(panFactor, 0) // Pan Right (move map left, so increase X)
-
-		// --- Zooming ---
-		case "K": // Zoom In (Shift+k)
-			m.zoom(1 / zoomFactor) // Zoom in (divide by factor)
-		case "L": // Zoom Out (Shift+l)
-			m.zoom(zoomFactor) // Zoom out (multiply by factor)
-
-		// --- Reset ---
+			m.pan(panFactor, 0)
+		case "K":
+			m.zoom(1 / zoomFactor)
+		case "L":
+			m.zoom(zoomFactor)
 		case "r":
 			m.viewBounds = m.originalBounds
 		}
@@ -195,9 +202,6 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 // project converts lon/lat to terminal x/y coordinates
 func (m *Model) project(lon, lat float64, viewWidth, viewHeight int) (int, int) {
-	// Project based on the *current viewBounds*, not the original bounds
-
-	// Avoid divide by zero if perfectly zoomed in
 	if m.viewBounds.MaxX == m.viewBounds.MinX {
 		m.viewBounds.MaxX += 1e-6
 	}
@@ -205,11 +209,9 @@ func (m *Model) project(lon, lat float64, viewWidth, viewHeight int) (int, int) 
 		m.viewBounds.MaxY += 1e-6
 	}
 
-	// Normalize coordinates to [0, 1] based on the current view
 	x := (lon - m.viewBounds.MinX) / (m.viewBounds.MaxX - m.viewBounds.MinX)
 	y := (m.viewBounds.MaxY - lat) / (m.viewBounds.MaxY - m.viewBounds.MinY)
 
-	// Scale to TUI dimensions
 	tuiX := int(x * float64(viewWidth))
 	tuiY := int(y * float64(viewHeight))
 	return tuiX, tuiY
@@ -218,10 +220,10 @@ func (m *Model) project(lon, lat float64, viewWidth, viewHeight int) (int, int) 
 // renderMapViewport generates ASCII map
 func (m Model) renderMapViewport(viewWidth, viewHeight int) string {
 	if viewWidth <= 0 {
-		viewWidth = 1 // Avoid zero-size grid
+		viewWidth = 1
 	}
 	if viewHeight <= 0 {
-		viewHeight = 1 // Avoid zero-size grid
+		viewHeight = 1
 	}
 
 	grid := make([][]rune, viewHeight)
@@ -239,57 +241,61 @@ func (m Model) renderMapViewport(viewWidth, viewHeight int) string {
 			polyBounds.MinX > m.viewBounds.MaxX ||
 			polyBounds.MaxY < m.viewBounds.MinY ||
 			polyBounds.MinY > m.viewBounds.MaxY {
-			continue // Skip this polygon, it's not in view
+			continue
 		}
 
 		for _, point := range polygon.Points {
 			x, y := m.project(point.X, point.Y, viewWidth, viewHeight)
-			// Draw if projected point is within the TUI grid
 			if x >= 0 && x < viewWidth && y >= 0 && y < viewHeight {
 				grid[y][x] = '.'
 			}
 		}
 	}
 
-	// 2. Draw Airports (on top of the map)
+	// 2. Draw Airports (on top of map)
 	for _, point := range m.airportPoints {
-		// Project the single airport point
 		x, y := m.project(point.X, point.Y, viewWidth, viewHeight)
-
-		// Draw if projected point is within the TUI grid
 		if x >= 0 && x < viewWidth && y >= 0 && y < viewHeight {
-			// Use a different character for airports
-			// This will draw *over* a map line '.' if they overlap
 			grid[y][x] = '*'
 		}
 	}
 
+	// 3. Draw Aircraft (on top of airports and map)
+	// <-- 5. Add render loop for aircraft
+	for _, ac := range m.aircraft {
+		// Only draw if we have a position
+		if ac.Lat == 0 && ac.Lon == 0 {
+			continue
+		}
+
+		x, y := m.project(ac.Lon, ac.Lat, viewWidth, viewHeight)
+		if x >= 0 && x < viewWidth && y >= 0 && y < viewHeight {
+			grid[y][x] = '✈' // Use a plane emoji
+		}
+	}
+	// --- End of new section ---
+
+
 	var b strings.Builder
 	for _, row := range grid {
 		b.WriteString(string(row))
-		// ---
-		// THIS IS THE FIX: Changed 'b.WriteRn()' to 'b.WriteRune('\n')'
-		// ---
 		b.WriteRune('\n')
 	}
 	return b.String()
 }
 
 func (m Model) View() string {
-	// Define the style inside the View, so it recalculates on resize
 	mapStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("63")).
-		Width(m.width - 2).  // Use component's width (minus borders)
-		Height(m.height - 2) // Use component's height (minus borders)
+		Width(m.width - 2).
+		Height(m.height - 2)
 
-	// Get the *content* area size, which is the style's size minus borders/padding
 	hBorders := mapStyle.GetBorderLeftSize() + mapStyle.GetBorderRightSize()
 	vBorders := mapStyle.GetBorderTopSize() + mapStyle.GetBorderBottomSize()
 	hPadding := mapStyle.GetPaddingLeft() + mapStyle.GetPaddingRight()
 	vPadding := mapStyle.GetPaddingTop() + mapStyle.GetPaddingBottom()
 
-	// Note: GetWidth() and GetHeight() on a style are the *outer* dimensions
 	mapViewWidth := mapStyle.GetWidth() - hBorders - hPadding
 	mapViewHeight := mapStyle.GetHeight() - vBorders - vPadding
 
@@ -302,6 +308,5 @@ func (m Model) View() string {
 
 	mapContent := m.renderMapViewport(mapViewWidth, mapViewHeight)
 
-	// Render the final styled block
 	return mapStyle.Render(mapContent)
 }
