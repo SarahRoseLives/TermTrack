@@ -3,9 +3,10 @@ package main
 import (
 	"bufio"
 	"log"
+	"net" // <-- Import 'net'
 	"time"
 
-	"termtrack/sbs" // <-- 1. Import the new sbs package
+	"termtrack/sbs"
 	"termtrack/ui/footer"
 	"termtrack/ui/header"
 	mapview "termtrack/ui/map"
@@ -27,9 +28,11 @@ type model struct {
 	footerModel footer.Model
 
 	// --- SBS State ---
-	sbsScanner         *bufio.Scanner             // <-- 2. Hold the TCP scanner
-	aircraft           map[string]*sbs.Aircraft // <-- 3. Master aircraft list
-	initialPositionFound bool                       // <-- 4. For auto-zoom
+	sbsScanner *bufio.Scanner
+	sbsConn    net.Conn // <-- Store the connection
+	aircraft   map[string]*sbs.Aircraft
+
+	initialPositionFound bool // <-- 1. ADD THIS FLAG
 	// ---------------
 
 	err error // Store any errors
@@ -56,13 +59,50 @@ func initialModel() model {
 		headerModel: headerMod,
 		mapModel:    mapMod,
 		footerModel: footerMod,
-		aircraft:    make(map[string]*sbs.Aircraft), // <-- 5. Initialize the map
+		aircraft:    make(map[string]*sbs.Aircraft),
+		// initialPositionFound is 'false' by default
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return sbs.ConnectCmd() // <-- 6. Start the SBS connection on init
+	// Start BOTH the connection AND the render ticker
+	return tea.Batch(
+		sbs.ConnectCmd(),
+		TickCmd(),
+	)
 }
+
+// mergeAircraft is a helper to update the master aircraft list
+func (m *model) mergeAircraft(update *sbs.Aircraft) {
+	if update == nil {
+		return
+	}
+
+	// Get or create aircraft in our master list
+	ac, ok := m.aircraft[update.ICAO]
+	if !ok {
+		ac = update // This is the first time we see it
+		m.aircraft[update.ICAO] = ac
+		return
+	}
+
+	// Merge the new data
+	if update.Callsign != "" {
+		ac.Callsign = update.Callsign
+	}
+	if update.Lat != 0 && update.Lon != 0 {
+		ac.Lat = update.Lat
+		ac.Lon = update.Lon
+	}
+	if update.Speed != 0 {
+		ac.Speed = update.Speed
+	}
+	if update.Track != 0 {
+		ac.Track = update.Track
+	}
+	ac.LastSeen = time.Now()
+}
+
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// --- Global Error Handling ---
@@ -102,9 +142,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		cmds = append(cmds, headerCmd, mapCmd, footerCmd)
 
-	// --- 7. Handle SBS Messages ---
+	// --- Handle SBS Messages ---
 	case sbs.SbsConnectedMsg:
 		m.sbsScanner = msg.Scanner
+		m.sbsConn = msg.Conn // <-- Save the connection
 		// Start listening for the first line
 		cmds = append(cmds, sbs.WaitForSbsLine(m.sbsScanner))
 
@@ -113,53 +154,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case sbs.AircraftUpdateMsg:
-		if msg.Update != nil {
-			update := msg.Update
+		// --- DATA LOOP ---
+		m.mergeAircraft(msg.Update)
 
-			// Get or create aircraft in our master list
-			ac, ok := m.aircraft[update.ICAO]
-			if !ok {
-				ac = update // This is the first time we see it
-				m.aircraft[update.ICAO] = ac
-			}
-
-			// Merge the new data
-			if update.Callsign != "" {
-				ac.Callsign = update.Callsign
-			}
-			if update.Lat != 0 && update.Lon != 0 {
-				ac.Lat = update.Lat
-				ac.Lon = update.Lon
-			}
-			if update.Speed != 0 {
-				ac.Speed = update.Speed
-			}
-			if update.Track != 0 {
-				ac.Track = update.Track
-			}
-			ac.LastSeen = time.Now()
-
-			// --- Handle Auto-Zoom ---
-			if ac.Lat != 0 && !m.initialPositionFound {
-				m.initialPositionFound = true
-				// Tell the map to zoom to this location
-				m.mapModel.SetViewToLocation(ac.Lat, ac.Lon)
-				// Update footer's zoom level
-				m.footerModel.SetZoom(m.mapModel.GetZoomLevel())
-			}
-
-			// Pass the *entire* updated map to the component
-			m.mapModel.UpdateAircraft(m.aircraft)
+		// --- 2. ADD THIS AUTO-ZOOM BLOCK ---
+		if !m.initialPositionFound && msg.Update != nil && msg.Update.Lat != 0 {
+			m.initialPositionFound = true // Set flag
+			// Tell the map to auto-zoom
+			m.mapModel.SetViewToLocation(msg.Update.Lat, msg.Update.Lon)
+			// Sync the footer's zoom level
+			m.footerModel.SetZoom(m.mapModel.GetZoomLevel())
 		}
+		// --- END AUTO-ZOOM BLOCK ---
 
-		// Always listen for the next line
+		// Ask for the next line (fast)
 		cmds = append(cmds, sbs.WaitForSbsLine(m.sbsScanner))
-	// --- End of SBS Handling ---
+		// --- We DO NOT update the map here ---
 
+	// --- RENDER LOOP ---
+	case TickMsg:
+		// The render ticker fired.
+		// 1. Tell the map to update with the *current* aircraft list
+		m.mapModel.UpdateAircraft(m.aircraft)
+		// 2. Ask for the next tick
+		cmds = append(cmds, TickCmd())
 
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
+			// Cleanly close the connection
+			if m.sbsConn != nil {
+				m.sbsConn.Close()
+			}
 			return m, tea.Quit
 		default:
 			// Pass all other keys to the map model

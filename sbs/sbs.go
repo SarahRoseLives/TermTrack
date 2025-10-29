@@ -27,6 +27,7 @@ type Aircraft struct {
 // SbsConnectedMsg is sent when we successfully connect to the feed
 type SbsConnectedMsg struct {
 	Scanner *bufio.Scanner
+	Conn    net.Conn // <-- ADD THIS
 }
 
 // SbsErrorMsg is sent when a connection or parsing error occurs
@@ -49,7 +50,7 @@ func ConnectCmd() tea.Cmd {
 		}
 
 		scanner := bufio.NewScanner(conn)
-		return SbsConnectedMsg{Scanner: scanner}
+		return SbsConnectedMsg{Scanner: scanner, Conn: conn} // <-- PASS CONN HERE
 	}
 }
 
@@ -64,13 +65,19 @@ func WaitForSbsLine(scanner *bufio.Scanner) tea.Cmd {
 		}
 
 		line := scanner.Text()
-		return parseSbsLine(line)
+
+		// Parse and return the single update
+		if acUpdate := parseSbsLine(line); acUpdate != nil {
+			return AircraftUpdateMsg{Update: acUpdate}
+		}
+
+		// If parseSbsLine returned nil, we send nil.
+		return AircraftUpdateMsg{Update: nil}
 	}
 }
 
-// parseSbsLine attempts to parse a single line into an AircraftUpdateMsg
-// It returns nil if the message type is not one we care about
-func parseSbsLine(line string) tea.Msg {
+// parseSbsLine attempts to parse a single line into an *Aircraft struct
+func parseSbsLine(line string) *Aircraft {
 	fields := strings.Split(line, ",")
 	if len(fields) < 11 || fields[0] != "MSG" {
 		return nil // Not a message, or too short, ignore
@@ -83,7 +90,7 @@ func parseSbsLine(line string) tea.Msg {
 		return nil // No ICAO, can't track
 	}
 
-	// Create a partial update. main.go will merge it.
+	// Create a partial update.
 	update := &Aircraft{
 		ICAO:     icao,
 		LastSeen: time.Now(),
@@ -116,5 +123,9 @@ func parseSbsLine(line string) tea.Msg {
 		return nil // We don't care about this message type
 	}
 
-	return AircraftUpdateMsg{Update: update}
+	// Only return if we actually got useful data (callsign, pos, or vel)
+	if update.Callsign != "" || update.Lat != 0 || update.Speed != 0 {
+		return update
+	}
+	return nil
 }
